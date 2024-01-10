@@ -1,0 +1,542 @@
+---
+title: "MY472 Assignment 4"
+author: 'Student ID: 34947'
+date: "2024-01-10"
+output: html_document
+---
+<style>
+p.caption {
+  font-size: 1.5em;
+}
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+##### Github Repo
+
+My project is hosted [here](https://github.com/jbank19/spotify_hero) on github in a public repository. 
+
+### Introduction
+
+In 2010, Rolling Stone, a news/media company, published a (subjective) ranking of the 100 greatest musical artists of all time. This report aims to answer two research questions concerning the list:
+
+
+ 1. How popular do the artists in Rolling Stone's Top 100 list remain as of 2023?
+ 2. What discernible factors contribute to their enduring popularity?
+ 
+To answer the first question, this report assesses how popular the Rolling Stone artists are on Spotify's music streaming platform relative to other artists via useful data visualisations. To answer the second question, a multiple linear regression model is estimated. The model cannot be causally interpreted for many reasons (e.g. omitted variable bias). However, information on how correlated various factors are with an artist's popularity after controlling for other factors is still instructive.
+ 
+```{r load packages, message = FALSE, warning = FALSE}
+
+# load all of necessary packages for the project
+library(tidyverse)
+library(rvest)
+library(RSelenium)
+library(netstat)
+library(httr)
+library(openssl)
+library(jsonlite)
+library(ggplot2)
+library(broom)
+library(stargazer)
+library(htmltools)
+```
+
+### Data
+
+Two different data sources are used. The Rolling Stone rankings are scraped from Rolling Stone's [website](www.rollingstone.com/music/music-lists/100-greatest-artists-147446/talking-heads-49251/) and stored in a data frame using a Selenium Driver. No data cleaning is required.
+
+```{r rs data, message = FALSE, warning = FALSE, cache = TRUE}
+
+# Start the project by scraping the Rolling Stone Top 100 list...
+
+web_page <- "https://www.rollingstone.com/music/music-lists/100-greatest-artists-147446/talking-heads-49251/"
+
+# open a new Selenium driver
+rD <- rsDriver(browser=c("firefox"), port = free_port(random = TRUE), chromever = NULL, verbose = FALSE) 
+driver <- rD$client
+  
+# navigate to the Rolling Stone web page
+driver$navigate(web_page)
+
+# close cookie pop-up window if necessary (the try ensures that the code works regardless of whether the popu-up is there or not)
+try({
+  accept_button <- driver$findElement(using = "xpath", value = '//*[@id="onetrust-accept-btn-handler"]')
+  accept_button$clickElement()
+}, silent = TRUE)
+
+
+# Create empty tibble for storing the output information (artist name and artist rank in the list)
+rs_top100 <- tibble(name = character(length = 100), rank = character(length = 100))
+
+# identify the information we need for first 50 bands (only 50 results are displayed per page)
+band_names1 <- driver$findElements(using = "class name", value = "c-gallery-vertical-album__title")
+band_ranks1 <- driver$findElements(using = "class name", value = "c-gallery-vertical-album__number")
+
+# And store the information in the output data frame
+for (i in 1:length(band_names1)) { 
+  
+  rs_top100$name[[i]] <- read_html(band_names1[[i]]$getElementAttribute("outerHTML")[[1]]) %>%
+    html_text()
+  
+  rs_top100$rank[[i]] <- read_html(band_ranks1[[i]]$getElementAttribute("outerHTML")[[1]]) %>%
+    html_text()
+}
+
+Sys.sleep(1) # pause before moving on to ensure we remain a good scraping citizen
+
+# navigate Driver to the next page with the last 50 artists
+next_button <- driver$findElement(using = "class name", value = "c-gallery-vertical__load-button")
+next_button$clickElement()
+
+# once again, identify the relevant information for the final 50 artists
+band_names2 <- driver$findElements(using = "class name", value = "c-gallery-vertical-album__title")
+band_ranks2 <- driver$findElements(using = "class name", value = "c-gallery-vertical-album__number")
+
+# And store the information in the output data frame
+for (i in 1:length(band_names2)) {
+  
+  rs_top100$name[[i + 50]] <- read_html(band_names2[[i]]$getElementAttribute("outerHTML")[[1]]) %>%
+  html_text()
+  
+  rs_top100$rank[[i + 50]] <- read_html(band_ranks2[[i]]$getElementAttribute("outerHTML")[[1]]) %>%
+  html_text()
+}
+
+# close the driver now that we are done scraping
+driver$close()
+```
+
+The bulk of the analytical data come from [Spotify's web API](https://developer.spotify.com/documentation/web-api). Artist-level information is extracted from Spotify's "Search" endpoint by querying artists' names. Information for each artist in Rolling Stone's list are extracted using the already-scraped data. 
+
+In addition, separate API requests are used to construct a sample (n = 1000) of 'top' Spotify artists (by not specifying any artist names). This sample helps contextualise the information for the Rolling Stone artists. It is unclear how exactly Spotify's API decides what results to show, but it is clearly correlated highly with artist popularity. 
+
+The main variable of interest is Spotify's artist popularity score: a number from 0-100 that reflects the number of times and how recently artists' songs are played. It is therefore a good proxy for measuring the endurance of an artist's music at a given point in time. Other useful information includes the musical genres associated with an artist. Several genre-based variables are derived from this information, including indicator variables for key genres.
+
+These artist-level data are augmented with album data from Spotify's "Artists" endpoint. Extracting these data requires sending API requests containing the Spotify ID numbers for the relevant artists. The album-level data are summarised in various ways at the artist level (including total number of albums released, year of first album release, and most productive decade in terms of album releases).
+
+The combined/main analytical dataset contains artist-level information for 1054 artists (46 artists are in Rolling Stone's Top 100 List and Spotify's top 1000 artist results).
+
+```{r spotify api credentials}
+
+# To access the Spotify data, we need a valid API access token...
+
+# Retrieve personal api credentials (client id and client secret); note that you will need your own to execute the code
+readRenviron("~/Documents/Personal/Env/.Renviron") 
+client_id <- Sys.getenv("spotify_client")
+client_secret <- Sys.getenv("spotify_secret")
+
+# request api token
+response <- POST(
+  "https://accounts.spotify.com/api/token",
+  config = authenticate(user = client_id, 
+                        password = client_secret),
+  body = list(grant_type = "client_credentials"), 
+  encode = "form"
+)
+
+# extract api token from the response
+access_token <- content(response)$access_token
+```
+
+
+```{r spotify data, cache = TRUE}
+
+# Now we can use the api's search endpoint with our rolling stone data to access some useful artist-level information for all of the artists in Rolling Stone's Top 100 list
+
+search_endpoint <- "https://api.spotify.com/v1/search" # this is the url for the api endpoint
+
+# create empty list for storing the api responses
+parsed_combined <- list() 
+
+for (i in 1:length(rs_top100$name)) { #for each rolling stone artist name...
+  
+  response <- GET(url = search_endpoint, # query the endpoint and retrieve artist-level information (see type argument)
+                  query = list(q = rs_top100$name[[i]], type = "artist"), 
+                  add_headers(Authorization = paste("Bearer", access_token)) # supply requisite api credentials
+                  )
+  
+  parsed_response <- content(response, "parsed")$artists$items # parse the JSON response
+  
+  parsed_combined[[i]] <- parsed_response
+}
+
+parsed_combined_flat <- list_flatten(parsed_combined) # make the output structure more tabular
+
+rs_artists <- tibble(name = as.character(), uri = as.character(), 
+                       popularity = numeric(), id = as.character(), 
+                       href = as.character(), followers = numeric(),
+                       genre_count = numeric(), genre = list()) # create empty  data frame for storing the final outputs
+
+
+ for (artist in seq_along(parsed_combined_flat)) { # fill the data frame with the useful information we want
+   rs_artists <- add_row(rs_artists,
+                           name = parsed_combined_flat[[artist]]$name,
+                           uri = parsed_combined_flat[[artist]]$uri,
+                           popularity = parsed_combined_flat[[artist]]$popularity, # key variable of interest
+                           id = parsed_combined_flat[[artist]]$id,
+                           href = parsed_combined_flat[[artist]]$href,
+                           followers = parsed_combined_flat[[artist]]$followers[[2]],
+                           genre_count = length(parsed_combined_flat[[artist]]$genre),
+                           genre = list(parsed_combined_flat[[artist]]$genre))
+                          # each artist is associated with a list of genres
+  }
+
+# remove any duplicates and clean the artist names
+rs_artists_clean <- rs_artists %>%
+  distinct() %>% 
+  mutate(name = str_replace_all(name, "&", "and")) %>%
+  mutate(name = str_replace_all(name, "\\sThe", " the")) %>%
+  mutate(name = str_replace_all(name, "\\sAnd", " and")) %>%
+  mutate(name = str_replace_all(name, "N'", "n’")) %>%
+  mutate(name = str_replace_all(name, "M.G.'s", "MGs")) %>%
+  mutate(name = str_replace_all(name, "^Ramones$", "The Ramones")) %>%
+  mutate(name = str_replace_all(name, "Allman", "The Allman")) %>%
+  mutate(name = str_replace_all(name, "D.M.C.", "DMC")) %>%
+  mutate(name = str_replace_all(name, "–", "-")) %>%
+  mutate(name = str_replace_all(name, "'", "’")) %>%
+  mutate(name = str_replace_all(name, "Parliament", "Parliament and")) %>%
+  mutate(name = str_replace_all(name, "Sex", "The Sex")) %>%
+  mutate(name = str_replace_all(name, "JAY", "Jay")) %>%
+  mutate(name = str_replace_all(name, "2Pac", "Tupac Shakur")) %>%
+  mutate(name = str_replace_all(name, "Four Tops", "The Four Tops")) %>% 
+  left_join(rs_top100, by = c("name")) %>%
+  filter(is.na(rank) == FALSE) %>%
+  mutate(rank = as.numeric(rank)) %>%
+  arrange(rank) %>%
+  group_by(name) %>%
+  filter(popularity == max(popularity)) %>% # some artists have duplicate listings; keep ones with highest popularity
+  ungroup()
+
+```
+
+
+```{r top 1000 artists, cache = TRUE}
+
+# Next, we perform a similar exercise to extract a separate sample (for comparison purposes) of the top 1000 artist results that Spotify's api returns
+
+# create empty list for storing the api responses
+parsed_combined <- list()
+
+limits <- seq(0, 1000, 50) # we can only get 50 results per api request; this object allows us to stack multiple requests in a for loop by specifying the 'offset' argument (see code directly below)
+
+for (i in 1:length(limits)) { # execute desired api requests
+
+response <- GET(url = search_endpoint, # the offset arguments allows us to get past the first page of results
+                query = list(q = "year:2023", type = "artist", limit = 50, offset = limits[[i]]), # 50 is the maximum limit/number of results we can get per api query
+                add_headers(Authorization = paste("Bearer", access_token))
+)
+
+parsed_response <- content(response, "parsed")$artists$items
+
+parsed_combined[[i]] <- parsed_response
+
+Sys.sleep(1) # to implement good API practices
+
+}
+
+
+parsed_combined_flat <- list_flatten(parsed_combined) # make the parsed api responses more tabular
+
+# create empty data frame for storing the final outputs
+spotify_top1000 <- tibble(name = as.character(), uri = as.character(), 
+                       popularity = numeric(), id = as.character(), 
+                       href = as.character(), followers = numeric(),
+                       genre_count = numeric(), genre = list())
+
+
+# then populate the empty data frame with the data we want
+for (artist in seq_along(parsed_combined_flat)) {
+  spotify_top1000 <- add_row(spotify_top1000,
+                          name = parsed_combined_flat[[artist]]$name,
+                          uri = parsed_combined_flat[[artist]]$uri,
+                          popularity = parsed_combined_flat[[artist]]$popularity,
+                          id = parsed_combined_flat[[artist]]$id,
+                          href = parsed_combined_flat[[artist]]$href,
+                          followers = parsed_combined_flat[[artist]]$followers[[2]],
+                          genre_count = length(parsed_combined_flat[[artist]]$genre),
+                          genre = list(parsed_combined_flat[[artist]]$genre))
+}
+
+
+```
+
+```{r combine rolling stone and spotify artist data}
+
+# Finally, we can combine the rolling stone top 100 and spotify top 1000 results data into a single analytical dataset
+
+spotify_artists_clean <- spotify_top1000 %>%
+  filter(!(id %in% rs_artists_clean$id)) %>% # remove rolling stone artists in spotify top 1000 to avoid duplicates
+  mutate(rank = as.numeric(NA)) %>%
+  rows_append(rs_artists_clean) %>% # combine rolling stone sample with spotify top 1000 sample
+  mutate(rs_indicator = as.character(case_when(is.na(rank) == FALSE & id %in% spotify_top1000$id ~ "Rolling Stone Top 100 and Spotify Top 1000*",
+                                               is.na(rank) == FALSE & !(id %in% spotify_top1000$id) ~ "Rolling Stone Top 100 only",
+                                  .default = "Spotify Top 1000 only")),
+         followers = followers/1000000)
+
+```
+
+### Analysis
+
+Overall, the popularity of artists in Rolling Stone's Top 100 list has endured decently through 2023 based on Spotify plays. Figure 1 below shows the frequency distribution of Spotify popularity scores for the sample of artists in Rolling Stone's list. While the average popularity score for this group (~ 65) is lower than Taylor Swift's score (100), it appears reasonably high and the entire distribution is well-to-the-right of the lowest possible score (0).
+
+
+```{r graph 1, fig.height = 6, fig.align = "center", fig.cap = "Figure 1", fig.topcaption = TRUE}
+
+### Research question 1 - visualisation analysis
+
+# create histogram graph to plot the distribution of popularity scores in the rolling stone sample
+
+rs_average_popularity <- mean(rs_artists_clean$popularity) # we want to display this information on the graph
+
+ggplot(rs_artists_clean, aes(x = popularity)) +
+  geom_histogram(binwidth = 5, boundary = 0, fill = "grey", colour = "black") +
+  geom_vline(xintercept = rs_average_popularity, linetype = "dashed", color = "red", linewidth = 1) +
+  geom_label(aes(label = "Average across\nRolling Stone's Top 100", x = 50, y = 17),colour = "red", label.size = NA) +
+  geom_vline(xintercept = 100, linetype = "dashed", color = "#FF69B4", linewidth = 1) +
+  geom_label(aes(label = "Taylor Swift", x = 92, y = 18),colour = "#FF69B4", label.size = NA) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "navy", linewidth = 1) +
+  geom_label(aes(label = "Lowest possible score", x = 13, y = 12),colour = "navy", label.size = NA) +
+  scale_y_continuous(limits = c(0, 20), expand = c(0, 0)) +
+  scale_x_continuous(limits = c(0, 100), breaks = seq(0, 100, 10), expand = c(0.02, 0.02)) +
+  ylab("Number of artists in each bin (no.)") +
+  xlab("Spotify popularity score bins") +
+  theme_minimal() +
+  ggtitle(label = "Spotify 2023 Popularity Score Histogram",
+          subtitle = "Artists in Rolling Stone's Top 100 List") +
+  labs(caption = "Sources: Author's calculations; Spotify") +
+  theme_bw() +
+  theme(panel.grid.minor.x = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        panel.grid.major.x = element_blank(),
+        axis.title.y.right = element_text(angle = 270, hjust = 0.5, vjust = 0.5),
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+        plot.subtitle = element_text(hjust = 0.5, size = 12),
+        legend.title = element_blank(),
+        legend.position = c(0.25, 0.9),
+        plot.caption = element_text(hjust = 0))
+
+```
+
+However, the popularity of artists in Rolling Stone's Top 100 list appears low relative to the popularity of the top 1000 Spotify artist results. Figure 2 below plots the average popularity score for the Rolling Stone sample alongside the averages for each decile within the Spotify sample. The average for the Rolling Stone sample is only marginally above the average score for the first decile.
+
+```{r graph 2, fig.height = 6, fig.align = "center", fig.cap = "Figure 2", fig.topcaption = TRUE}
+
+# create decile graph to compare the popularity of the rolling stone artists with the Spotify top 1000 artists
+
+# prepare the data for graphing
+rs100_mean_popularity <- mean(rs_artists_clean$popularity)
+
+graph2_data <- spotify_top1000 %>%
+  mutate(decile = as.character(ntile(popularity, 10))) %>% # identify the decile that each artist belongs to
+  group_by(decile) %>%
+  summarise(value = mean(popularity)) %>% # calculate the mean popularity score for each decile
+  ungroup() %>%
+  add_row(decile = "Rolling\nStone\nsample", value = rs100_mean_popularity) %>% # add the rolling stone mean popularity score to the graph dataset
+  arrange(value) %>%
+  mutate(rs_indicator = case_when(decile == "Rolling\nStone\nsample" ~ "Rolling Stone Top 100 List",
+                                  .default = "Spotify Top Artist Sample"),
+         measure = "popularity")
+
+graph2_data <- graph2_data %>%
+  mutate(decile = factor(decile, levels = graph2_data$decile[order(graph2_data$value)])) %>%
+  mutate(decile_numeric = as.numeric(decile)) # this code ensures that the bars in chart are displayed in ascending order
+
+# plot the graph
+ggplot(data = graph2_data) +
+  geom_bar(aes(x = decile_numeric, y = value, fill = rs_indicator), stat = "identity") +
+  scale_fill_manual(values = c("lightblue", "navy")) +
+  scale_x_continuous(breaks = 1:length(unique(graph2_data$decile_numeric)),
+                       labels = unique(graph2_data$decile),
+                       expand = c(0.01, 0)) +
+  ggtitle(label = "Artist Popularity on Spotify in 2023",
+          subtitle = "Average across Spotify sample deciles and Rolling Stone Top 100 list*") +
+  ylab("Popularity score") +
+  xlab("Decile group") +
+  labs(caption = "*     Some artists are included in both the Spotify sample and the Rolling Stone Top 100 list\nSources: Author's calculations; Spotify") +
+  scale_y_continuous(limits = c(0, 100),
+                     sec.axis = sec_axis(~ ., name = "Popularity score"),
+                     expand = c(0, 0)) +
+  theme_bw() +
+  theme(panel.grid.minor.x = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        panel.grid.major.x = element_blank(),
+        axis.title.y.right = element_text(angle = 270, hjust = 0.5, vjust = 0.5),
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+        plot.subtitle = element_text(hjust = 0.5, size = 12),
+        legend.title = element_blank(),
+        legend.position = c(0.17, 0.875),
+        plot.caption = element_text(hjust = 0))
+  
+```
+
+There is also considerable variation in popularity across artists. Figure 3 below, which plots Spotify popularity scores against follower numbers for each artist sampled, demonstrates this.
+
+```{r graph 3, message=FALSE, warning=FALSE, fig.height = 6, fig.align = "center", fig.cap = "Figure 3", fig.topcaption = TRUE}
+
+# create scatter plot of spotify popularity vs followers to highlight the variation in the data
+
+ggplot(data = spotify_artists_clean) +
+  geom_point(mapping = aes(x = popularity, y = followers, colour = rs_indicator)) +
+  scale_color_manual(values = c("purple2", "lightblue", "navy")) +
+  scale_x_continuous(limits = c(0, 100), expand = c(0.0001, 0.5)) +
+  scale_y_continuous(limits = c(0, 150), expand = c(0.0001, 0.5)) +
+   ggtitle(label = "Music Artist Endurance on Spotify",
+          subtitle = "Popularity score versus follower count, as of 2023") +
+  ylab("Number of Spotify followers (millions)") +
+  xlab("Spotify popularity score") +
+    labs(caption = "*     Some artists are included in both the Spotify sample and the Rolling Stone Top 100 list\nSources: Author's calculations; Spotify") +
+  theme_bw() +
+  theme(panel.grid.minor.x = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        panel.grid.major.x = element_blank(),
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+        plot.subtitle = element_text(hjust = 0.5, size = 12),
+        legend.title = element_blank(),
+        legend.position = c(0.25, 0.85),
+        legend.text = element_text(size = 10),
+        axis.text = element_text(size = 10),
+        plot.caption = element_text(hjust = 0))
+
+```
+
+```{r extract album-level data, cache = TRUE}
+
+### Research Question 2 - regression analysis
+
+# To answer the second research question, we  first want to extract album-level data for each artist in our main analytical sample. We will derive explanatory variables for the regression model from these data. These data come from a different api endpoint. Requesting all these data from  the api takes a long time (~ 15 minutes) to execute. As a result, I have commented out the code and saved the output in a .RData file.
+
+#artist_album_stem <- "https://api.spotify.com/v1/artists/{id}/albums" # this is the artist api endpoint
+
+#parsed_combined <- list() # create empty list for storing the api responses 
+
+#for (artist in 1:nrow(spotify_artists_clean)) { # execute a separate request for each artist by using their unique spotify id numbers (we retrieved this information above from the search endpoint)
+  
+  #artist_album_url <- str_replace(artist_album_stem, "\\{id\\}", spotify_artists_clean$id[[artist]])
+  
+  #response <- GET(url = artist_album_url,
+                  #query = list(include_groups = "album"),
+                  #add_headers(Authorization = paste("Bearer", access_token)) # request the response
+                  #)
+  
+  #parsed_response <- content(response, "parsed")$items
+  
+  #parsed_combined[[artist]] <- parsed_response
+  
+  #Sys.sleep(0.5) # to be a good api citizen
+  
+#}
+
+#parsed_combined_flat <- list_flatten(parsed_combined)
+
+# create data frame for storing the final outputs 
+#spotify_albums <- tibble(band_id = as.character(), album_id = as.character(), band_name = as.character(),
+#                         album_name = as.character(), release_date = as.character(),
+#                         release_date_precision = as.character())
+    
+# for (album in seq_along(parsed_combined_flat)) { # populate the data frame with the information we want
+#   spotify_albums <- add_row(spotify_albums,
+#                             band_id = parsed_combined_flat[[album]]$artists[[1]]$id,
+#                             band_name = parsed_combined_flat[[album]]$artists[[1]]$name,
+#                             album_id = parsed_combined_flat[[album]]$id,
+#                             album_name = parsed_combined_flat[[album]]$name,
+#                             release_date = parsed_combined_flat[[album]]$release_date,
+#                             release_date_precision = parsed_combined_flat[[album]]$release_date_precision)
+
+# }
+
+#save(spotify_albums, file = "spotify_albums.RData")
+
+load("spotify_albums.RData") # this is the output from the commented-out code above.
+
+# With these data, we can now construct/derive some useful variables that we can use as explanatory variables in the regression analysis...
+
+# create a variable for an album's release year
+spotify_albums <- spotify_albums %>%
+  mutate(release_year = as.numeric(case_when(release_date_precision == "year" ~ release_date,
+                                  .default = str_extract(release_date, "^[[:digit:]]{4}"))))
+
+# create a new variable that identifies an artist's most productive decade (in terms of album releases)
+main_decade <- spotify_albums %>%
+  mutate(decade = (release_year %/% 10) * 10) %>% # this identifies the decade in which an album was released
+  group_by(band_id, decade) %>%
+  summarise(album_count = n()) %>% # count albums released each decade for each artist
+  arrange(desc(album_count)) %>%
+  slice(1) %>%
+  ungroup() %>%
+  rename("main_decade" = decade, "main_decade_album_count" = album_count)
+  
+# create new variables for first album year and latest album year  
+spotify_album_analytical <- spotify_albums %>%
+   group_by(band_id, band_name) %>%
+   summarise(album_count = n(),
+            latest_album_year = max(release_year),
+            first_album_year = min(release_year)) %>%
+  ungroup() %>%
+ left_join(main_decade, by = c("band_id"))
+ 
+```
+
+```{r combine spotify data}
+
+# Next, create a function for identifying key genres associated with each artist in the main analytical dataset
+
+contains_genres <- function(genre_list, genre_phrases) {
+  as.integer(any(sapply(genre_list, function(g) grepl(genre_phrases, g, ignore.case = TRUE))))
+}
+
+# Finally, add the album-based variables to the main analytical data set and create genre indicator variables for a few key genres
+
+spotify_complete_df <- spotify_artists_clean %>%
+  left_join(spotify_album_analytical, by = c("id" = "band_id")) %>%
+  rowwise() %>%
+  mutate(rap_indicator = contains_genres(genre, "rap|hip hop"),
+         pop_indicator = contains_genres(genre, "pop"),
+         rock_indicator = contains_genres(genre, "rock"),
+         soul_indicator = contains_genres(genre, "soul|blues")) %>%
+  mutate(other_genre_indicator = case_when(rap_indicator == 0 & pop_indicator == 0 & rock_indicator == 0 & soul_indicator == 0 ~ 1,
+                                           .default = 0))
+```
+
+Estimates from the regression model that attempts to explain this variation in the Rolling Stone sample are displayed in Table 1 below. Several interesting results stand out. First, genre seems to matter for artist endurance/popularity (relatively higher for rap music and lower for soul music). Second, numbers of albums released and popularity are highly correlated. However, it is difficult to isolate the direction of causality because popular artists are likely incentivised to release more music. Finally, the estimates on the time-based variables are difficult to collectively explain. It would not be surprising if newer artists were more popular on Spotify than older artists (e.g., recency bias; younger people using Spotify more than older people and liking newer music better). There is some supportive evidence for this; artists that released their first album more recently than others tend to be more popular on average. In contrast, artists' most productive decade (in terms of album releases) is negatively correlated with popularity. These contradictory results could reflect omitted variable bias (the R-squared value is small).
+
+<div style="text-align: center;">
+
+```{r execute regressions, message = FALSE, warning = FALSE, results = 'hide'}
+
+# Finally, we can estimate a linear regression model with all of the information we have extracted and transformed
+
+rs100_complete_df <- spotify_complete_df %>%
+  filter(is.na(rank) == FALSE) # create a subset of the final dataset that only contains the rolling stone music artists
+
+# estimate the regression model
+model1 <- lm(popularity ~ genre_count + album_count + first_album_year + main_decade + rap_indicator + pop_indicator + rock_indicator + soul_indicator, data = rs100_complete_df)
+
+# create a table of regression results to display in the knitted RMarkdown file
+stargazer(model1, type = "html",
+          title = c("Table 1: Regression Results"),
+          colnames = FALSE,
+          column.labels = c("Rolling Stone sample"),
+          dep.var.labels = "Spotify popularity score",
+          notes.align = "l",
+          omit.stat = c("f"),
+          out = "table1.html",
+          column.sep.width = "20pt")
+```
+
+
+```{r include corrected table, results = 'asis'}
+
+# this code is needed as a work around to fix an issue with how the notes of the table are displayed
+
+includeHTML("table1.html")
+
+```
+
+### Appendix: All code in this assignment
+
+```{r ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE} 
+
+```
